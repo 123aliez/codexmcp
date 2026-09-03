@@ -334,10 +334,9 @@ def run() -> None:
     host = os.getenv("MCP_HTTP_HOST")
     port = os.getenv("MCP_HTTP_PORT")
     if host or port:
-        mcp.run(
-            transport="streamable-http",
-            host=host or "0.0.0.0",
-            port=int(port or "8322"),
-        )
+        # 官方 SDK FastMCP.run() 不收 host/port；通过 Settings 的 env 前缀 FASTMCP_ 注入
+        os.environ.setdefault("FASTMCP_HOST", host or "0.0.0.0")
+        os.environ.setdefault("FASTMCP_PORT", port or "8322")
+        mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
