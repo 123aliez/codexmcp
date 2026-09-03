@@ -355,6 +355,14 @@ def run() -> None:
         # 因此在构造实例上直接覆盖 settings（run_streamable_http_async 读取的是 self.settings）
         mcp.settings.host = host or "0.0.0.0"
         mcp.settings.port = int(port or "8322")
+        # 容器化反代部署：DNS rebinding 防护需放行上游 Nginx 传入的 Host（默认仅允许 localhost）
+        from mcp.server.transport_security import TransportSecuritySettings
+        extra_hosts = [h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["localhost", "127.0.0.1", *extra_hosts],
+            allowed_origins=[],
+        )
         mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
