@@ -334,9 +334,10 @@ def run() -> None:
     host = os.getenv("MCP_HTTP_HOST")
     port = os.getenv("MCP_HTTP_PORT")
     if host or port:
-        # 官方 SDK FastMCP.run() 不收 host/port；通过 Settings 的 env 前缀 FASTMCP_ 注入
-        os.environ.setdefault("FASTMCP_HOST", host or "0.0.0.0")
-        os.environ.setdefault("FASTMCP_PORT", port or "8322")
+        # 官方 SDK FastMCP.run() 不收 host/port，Settings 字段无默认（init 显式参数压过 env），
+        # 因此在构造实例上直接覆盖 settings（run_streamable_http_async 读取的是 self.settings）
+        mcp.settings.host = host or "0.0.0.0"
+        mcp.settings.port = int(port or "8322")
         mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
