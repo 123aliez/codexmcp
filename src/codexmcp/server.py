@@ -23,11 +23,19 @@ _CODEX_SEMAPHORE: threading.Semaphore | None = None
 
 
 def _cd_allowed(cd: Path) -> bool:
-    """cd 参数 allowlist（容器化部署：仅允许挂载的工作区内），逗号分隔环境变量 CODEX_CD_ALLOWLIST 可覆盖"""
+    """cd 参数 allowlist（容器化部署：仅允许挂载的工作区内），逗号分隔环境变量 CODEX_CD_ALLOWLIST 可覆盖。
+    审查修复：resolve 后用 is_relative_to 判定，防 .. 与符号链接逃逸。"""
     allowlist = [p.strip() for p in os.getenv("CODEX_CD_ALLOWLIST", "/workspace").split(",") if p.strip()]
-    cd_str = str(cd)
+    try:
+        real_cd = Path(cd).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False  # 路径不存在也拒绝（工具约定调用方给已存在的工作区）
     for allowed in allowlist:
-        if cd_str == allowed or cd_str.startswith(allowed.rstrip("/") + "/"):
+        try:
+            real_allowed = Path(allowed).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if real_cd == real_allowed or real_cd.is_relative_to(real_allowed):
             return True
     return False
 
@@ -213,6 +221,15 @@ async def codex(
         }
 
     # Build command as list to avoid injection
+    # 服务端安全上限：部署方可用 CODEX_MAX_SANDBOX 限制允许的最高 sandbox 级别与 yolo
+    #   read-only（默认）| workspace-write | danger-full-access
+    _max_sandbox = os.getenv("CODEX_MAX_SANDBOX", "danger-full-access")
+    _levels = ["read-only", "workspace-write", "danger-full-access"]
+    if yolo and _max_sandbox == "read-only":
+        yolo = False
+    if _levels.index(sandbox) > _levels.index(_max_sandbox):
+        sandbox = _max_sandbox
+
     cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
     
     if len(image):
