@@ -18,6 +18,19 @@ import shutil
 
 mcp = FastMCP("Codex MCP Server-from guda.studio")
 
+# 并发信号量（run() 中按 CODEX_MAX_CONCURRENCY 初始化）：多 agent 共享网关时限制同时运行的 codex 子进程数
+_CODEX_SEMAPHORE: threading.Semaphore | None = None
+
+
+def _cd_allowed(cd: Path) -> bool:
+    """cd 参数 allowlist（容器化部署：仅允许挂载的工作区内），逗号分隔环境变量 CODEX_CD_ALLOWLIST 可覆盖"""
+    allowlist = [p.strip() for p in os.getenv("CODEX_CD_ALLOWLIST", "/workspace").split(",") if p.strip()]
+    cd_str = str(cd)
+    for allowed in allowlist:
+        if cd_str == allowed or cd_str.startswith(allowed.rstrip("/") + "/"):
+            return True
+    return False
+
 
 def _empty_str_to_none(value: str | None) -> str | None:
     """Convert empty strings to None for optional UUID parameters."""
@@ -192,6 +205,13 @@ async def codex(
     ] = "",
 ) -> Dict[str, Any]:
     """Execute a Codex CLI session and return the results."""
+    # cd allowlist：容器化部署仅允许挂载工作区，拒绝任意目录
+    if not _cd_allowed(cd):
+        return {
+            "success": False,
+            "error": f"cd 路径不在允许列表内（CODEX_CD_ALLOWLIST，默认 /workspace）: {cd}",
+        }
+
     # Build command as list to avoid injection
     cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
     
@@ -225,64 +245,99 @@ async def codex(
     err_message = ""
     thread_id: Optional[str] = None
 
-    for line in run_shell_command(cmd):
-        try:
-            line_dict = json.loads(line.strip())
-            all_messages.append(line_dict)
-            item = line_dict.get("item", {})
-            item_type = item.get("type", "")
-            if item_type == "agent_message":
-                agent_messages = agent_messages + item.get("text", "")
-            if line_dict.get("thread_id") is not None:
-                thread_id = line_dict.get("thread_id")
-            if "fail" in line_dict.get("type", ""):
-                success = False if len(agent_messages) == 0 else success
-                err_message += "\n\n[codex error] " + line_dict.get("error", {}).get("message", "")
-            if "error" in line_dict.get("type", ""):
-                error_msg = line_dict.get("message", "")
-                import re
-                is_reconnecting = bool(re.match(r'^Reconnecting\.\.\.\s+\d+/\d+', error_msg))
-                
-                if not is_reconnecting:
-                    success = False if len(agent_messages) == 0 else success
-                    err_message += "\n\n[codex error] " + error_msg
-                    
-        except json.JSONDecodeError:
-            # import sys
-            # print(f"Ignored non-JSON line: {line}", file=sys.stderr)
-            err_message += "\n\n[json decode error] " + line
-            continue
-            
-        except Exception as error:
-            err_message += "\n\n[unexpected error] " + f"Unexpected error: {error}. Line: {line!r}"
-            success = False
-            break
-
-    if thread_id is None:
-        success = False
-        err_message = "Failed to get `SESSION_ID` from the codex session. \n\n" + err_message
-        
-    if len(agent_messages) == 0:
-        success = False
-        err_message = "Failed to get `agent_messages` from the codex session. \n\n You can try to set `return_all_messages` to `True` to get the full reasoning information. " + err_message
-
-    if success:
-        result: Dict[str, Any] = {
-            "success": True,
-            "SESSION_ID": thread_id,
-            "agent_messages": agent_messages,
-            # "PROMPT": PROMPT,
+    # 并发限制：信号量满时直接返回提示，不排队阻塞（MCP 客户端可自行重试）
+    if _CODEX_SEMAPHORE is None:
+        _CODEX_SEMAPHORE = threading.Semaphore(2)
+    if not _CODEX_SEMAPHORE.acquire(blocking=False):
+        return {
+            "success": False,
+            "error": "并发已满（CODEX_MAX_CONCURRENCY）：当前有其他 codex 任务在运行，请稍后重试。",
         }
+
+    try:
+        for line in run_shell_command(cmd):
+            try:
+                line_dict = json.loads(line.strip())
+                all_messages.append(line_dict)
+                item = line_dict.get("item", {})
+                item_type = item.get("type", "")
+                if item_type == "agent_message":
+                    agent_messages = agent_messages + item.get("text", "")
+                if line_dict.get("thread_id") is not None:
+                    thread_id = line_dict.get("thread_id")
+                if "fail" in line_dict.get("type", ""):
+                    success = False if len(agent_messages) == 0 else success
+                    err_message += "\n\n[codex error] " + line_dict.get("error", {}).get("message", "")
+                if "error" in line_dict.get("type", ""):
+                    error_msg = line_dict.get("message", "")
+                    import re
+                    is_reconnecting = bool(re.match(r'^Reconnecting\.\.\.\s+\d+/\d+', error_msg))
+                
+                    if not is_reconnecting:
+                        success = False if len(agent_messages) == 0 else success
+                        err_message += "\n\n[codex error] " + error_msg
+                    
+            except json.JSONDecodeError:
+                # import sys
+                # print(f"Ignored non-JSON line: {line}", file=sys.stderr)
+                err_message += "\n\n[json decode error] " + line
+                continue
+            
+            except Exception as error:
+                err_message += "\n\n[unexpected error] " + f"Unexpected error: {error}. Line: {line!r}"
+                success = False
+                break
+
+        if thread_id is None:
+            success = False
+            err_message = "Failed to get `SESSION_ID` from the codex session. \n\n" + err_message
         
-    else:
-        result = {"success": False, "error": err_message}
+        if len(agent_messages) == 0:
+            success = False
+            err_message = "Failed to get `agent_messages` from the codex session. \n\n You can try to set `return_all_messages` to `True` to get the full reasoning information. " + err_message
+
+        if success:
+            result: Dict[str, Any] = {
+                "success": True,
+                "SESSION_ID": thread_id,
+                "agent_messages": agent_messages,
+                # "PROMPT": PROMPT,
+            }
         
-    if return_all_messages:
+        else:
+            result = {"success": False, "error": err_message}
+        
+        if return_all_messages:
             result["all_messages"] = all_messages
 
-    return result
+        return result
+    finally:
+        _CODEX_SEMAPHORE.release()
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok", "version": "0.7.7-http", "service": "codexmcp"})
 
 
 def run() -> None:
-    """Start the MCP server over stdio transport."""
-    mcp.run(transport="stdio")
+    """HTTP 传输改造：设置 MCP_HTTP_HOST/MCP_HTTP_PORT 任一即走 streamable HTTP（容器化部署），
+    否则保持上游 stdio 行为。并发通过全局信号量限制（CODEX_MAX_CONCURRENCY，默认 2），
+    防止多 agent 共享时 codex 子进程数打爆宿主机。"""
+    import os
+
+    global _CODEX_SEMAPHORE
+    limit = max(1, int(os.getenv("CODEX_MAX_CONCURRENCY", "2")))
+    _CODEX_SEMAPHORE = threading.Semaphore(limit)
+
+    host = os.getenv("MCP_HTTP_HOST")
+    port = os.getenv("MCP_HTTP_PORT")
+    if host or port:
+        mcp.run(
+            transport="streamable-http",
+            host=host or "0.0.0.0",
+            port=int(port or "8322"),
+        )
+    else:
+        mcp.run(transport="stdio")
