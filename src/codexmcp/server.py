@@ -357,10 +357,25 @@ async def codex(
         _CODEX_SEMAPHORE.release()
 
 
+def build_review_cmd(provider: str, cd: Path, session_id: str) -> list[str]:
+    """review_tool 专用：固定参数的 codex exec 命令（客户端不可指定 sandbox/yolo/model/profile）。
+    sandbox=workspace-write 允许 Codex 写 scratch，但 §14 系统约束禁止修改项目文件；
+    工作区是临时快照，审查结束即删。"""
+    c = ["codex", "exec", "--sandbox", "workspace-write", "--cd", str(cd), "--json", "--skip-git-repo-check"]
+    if os.getenv("CODEXMCP_CODEX_EXECUTION_MODE", "yolo") == "yolo":
+        # 容器内 bwrap 不可用（apparmor+seccomp 双封），容器即沙箱（与现有 /codex 行为一致）
+        c.append("--yolo")
+    if provider == "custom":
+        c.extend(["-c", 'model_provider="custom"'])
+    if session_id:
+        c.extend(["resume", str(session_id)])
+    return c
+
+
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request):
     from starlette.responses import JSONResponse
-    return JSONResponse({"status": "ok", "version": "0.7.7-http", "service": "codexmcp"})
+    return JSONResponse({"status": "ok", "version": "0.8.0-remote-review", "service": "codexmcp"})
 
 
 def run() -> None:
@@ -388,6 +403,23 @@ def run() -> None:
             allowed_hosts=["localhost", "127.0.0.1", *extra_hosts],
             allowed_origins=[],
         )
+
+        # 远程审查模块：上传接口（custom_route）+ 审查三工具 + TTL 清理线程
+        from . import review_tool  # noqa: F401  注册 codex_project_review/continue/finalize
+        from . import upload_api
+        from . import workspace_manager
+
+        @mcp.custom_route("/v1/uploads", methods=["POST"])
+        async def _uploads(request):
+            return await upload_api.uploads_endpoint(request)
+
+        @mcp.custom_route("/v1/health", methods=["GET"])
+        async def _v1_health(request):
+            from starlette.responses import JSONResponse
+            return JSONResponse({"status": "ok", "remote_review": True})
+
+        workspace_manager.start_background_cleanup()
+
         mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
