@@ -276,6 +276,7 @@ async def codex(
         PROMPT = PROMPT
 
     # 并发限制：信号量满时直接返回提示，不排队阻塞（MCP 客户端可自行重试）
+    global _CODEX_SEMAPHORE
     if _CODEX_SEMAPHORE is None:
         _CODEX_SEMAPHORE = threading.Semaphore(2)
     if not _CODEX_SEMAPHORE.acquire(blocking=False):
