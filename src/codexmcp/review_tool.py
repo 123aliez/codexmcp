@@ -189,7 +189,8 @@ async def codex_project_review(
         _CODEX_SEMAPHORE.release()
         return {"success": False, "error": "该客户端已有审查任务在运行（每客户端并发 1），请稍后重试", "error_code": "BUSY"}
     try:
-        review_id = f"rev_{_rand_hex()}"
+        # 先向 DB 登记（由 DB 分配 review_id），再用同一 ID 建目录——保证目录名与 DB 一致
+        review_id = storage.new_review(upload, "<pending>", mode, previous_review_id, REVIEW_HARD_TTL)
         ws, meta_dir = workspace_manager.create_review_dirs(review_id)
         # 解包（已通过上传时校验，此处再做一次快速完整性校验防包被替换）
         archive = Path(upload["archive_path"])
@@ -207,7 +208,7 @@ async def codex_project_review(
             storage.set_upload_state(upload_id, "REJECTED", e.code)
             return {"success": False, "error": f"包校验失败: {e.message}", "error_code": e.code}
 
-        storage.new_review(upload, str(ws), mode, previous_review_id, REVIEW_HARD_TTL)
+        storage.set_review_workspace(review_id, str(ws))
 
         prompt = _SYSTEM_CONSTRAINTS + _MODE_HINTS.get(mode, _MODE_HINTS["review"]) + "\n\n用户指令：" + PROMPT
         if prev_summary:

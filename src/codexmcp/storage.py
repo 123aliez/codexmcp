@@ -137,6 +137,12 @@ def new_review(upload: dict, workspace: str, mode: str, prev_review_id: str, har
     return review_id
 
 
+def set_review_workspace(review_id: str, workspace: str) -> None:
+    with _DB_LOCK:
+        _connect().execute("UPDATE reviews SET workspace=? WHERE review_id=?", (workspace, review_id))
+        _connect().commit()
+
+
 def get_review(review_id: str, token_id: str) -> tuple[dict | None, str]:
     with _DB_LOCK:
         row = _connect().execute("SELECT * FROM reviews WHERE review_id=?", (review_id,)).fetchone()
