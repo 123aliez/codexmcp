@@ -54,10 +54,11 @@ async def uploads_endpoint(request: Request) -> JSONResponse:
     if not sha_field or len(sha_field) != 64 or not all(c in "0123456789abcdef" for c in sha_field):
         return _err("ARCHIVE_INVALID", "missing or malformed form field 'sha256'")
 
-    # 4. 流式写 staging + SHA-256 单遍计算
+    # 4. 流式写 staging + SHA-256 单遍计算（staging 文件名先随机占位，
+    #    校验全过后才用 DB 分配的 upload_id 登记，避免 ID 错位）
     workspace_manager.ensure_dirs()
-    upload_id = f"upl_{_rand_hex()}"
-    staging = workspace_manager.staging_path(upload_id)
+    staging_id = f"upl_{_rand_hex()}"
+    staging = workspace_manager.staging_path(staging_id)
     hasher = hashlib.sha256()
     total = 0
     try:
@@ -93,31 +94,30 @@ async def uploads_endpoint(request: Request) -> JSONResponse:
         staging.unlink(missing_ok=True)
         return _err("ARCHIVE_SHA256_MISMATCH", f"expected {sha_field}, got {actual_sha}")
 
-    # 6. 登记 DB（VALIDATING）
+    # 6. 校验通过再登记 DB（校验失败不入库——失败请求无需状态记录，避免 VALIDATING 残留）
     try:
         client_meta = json.loads(client_meta_raw) if isinstance(client_meta_raw, str) else {}
     except json.JSONDecodeError:
         client_meta = {}
-    storage.new_upload(token_id, str(staging), actual_sha, UPLOAD_TTL)
+    db_upload_id = storage.new_upload(token_id, str(staging), actual_sha, UPLOAD_TTL)
 
-    # 7. 安全校验（tar 逐项检查 + manifest 对账 + 敏感二次检测）——校验通过才解出临时目录后即删
-    #    校验只读包不解出 workspace（review 启动时才解），这里对包本身做全量校验
-    tmp_ws = staging.parent / f".validate-{upload_id}"
+    # 7. 安全校验（tar 逐项检查 + manifest 对账 + 敏感二次检测）——校验只读包，
+    #    解出的临时校验目录用完即删（workspace 在 review 启动时才正式解出）
+    tmp_ws = staging.parent / f".validate-{staging_id}"
     tmp_meta = tmp_ws / "meta"
     try:
         manifest = bundle_validator.validate_and_extract(staging, tmp_ws / "workspace", tmp_meta)
     except bundle_validator.ValidationError as e:
         staging.unlink(missing_ok=True)
-        storage.set_upload_state(upload_id, "REJECTED", e.code)
-        import shutil
-        shutil.rmtree(tmp_ws, ignore_errors=True)
         return _err(e.code, e.message)
     finally:
         import shutil
         shutil.rmtree(tmp_ws, ignore_errors=True)
 
-    # 8. 原子移动到 ready
-    ready = workspace_manager.promote_to_ready(upload_id)
+    # 8. 换名原子移动到 ready（DB 分配的 upload_id）+ 登记 READY（无 VALIDATING 残留）
+    upload_id = db_upload_id
+    ready = workspace_manager.ready_path(upload_id)
+    os.replace(staging, ready)
     storage.set_upload_state(
         upload_id, "READY",
         project_name=str(manifest.get("project_name", ""))[:200],
