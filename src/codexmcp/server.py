@@ -21,6 +21,27 @@ mcp = FastMCP("Codex MCP Server-from guda.studio")
 # 并发信号量（run() 中按 CODEX_MAX_CONCURRENCY 初始化）：多 agent 共享网关时限制同时运行的 codex 子进程数
 _CODEX_SEMAPHORE: threading.Semaphore | None = None
 
+# ── provider 优先级与降级（ChatGPT 登录额度优先，第三方 API 保底）──
+# CODEX_PROVIDER_ORDER：逗号分隔的尝试顺序，默认 "chatgpt,custom"
+#   chatgpt = 登录态（config.toml 无 model_provider 时的官方通道）
+#   custom  = 第三方 API（[model_providers.custom]）
+# 触发降级的错误形态：usage limit / 401 / 429 / rate limit / insufficient（从 codex 0.153 二进制提取的特征串）
+_FALLBACK_PATTERNS = (
+    "usage limit", "you've hit your", "rate limit", "too many requests",
+    "429", "401", "unauthorized", "insufficient", "quota", "exceeded",
+    "not logged in", "sign in again", "please sign in",
+)
+
+
+def _should_fallback(err_text: str) -> bool:
+    t = (err_text or "").lower()
+    return any(p in t for p in _FALLBACK_PATTERNS)
+
+
+def _provider_order() -> list[str]:
+    order = [s.strip() for s in os.getenv("CODEX_PROVIDER_ORDER", "chatgpt,custom").split(",") if s.strip()]
+    return [p for p in order if p in ("chatgpt", "custom")] or ["chatgpt", "custom"]
+
 
 def _cd_allowed(cd: Path) -> bool:
     """cd 参数 allowlist（容器化部署：仅允许挂载的工作区内），逗号分隔环境变量 CODEX_CD_ALLOWLIST 可覆盖。
@@ -230,37 +251,29 @@ async def codex(
     if _levels.index(sandbox) > _levels.index(_max_sandbox):
         sandbox = _max_sandbox
 
-    cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
-    
-    if len(image):
-        cmd.extend(["--image", ",".join(image)])
-        
-    if model:
-        cmd.extend(["--model", model])
-        
-    if profile:
-        cmd.extend(["--profile", profile])
-        
-    if yolo:
-        cmd.append("--yolo")
-    
-    if skip_git_repo_check:
-        cmd.append("--skip-git-repo-check")
-
-    if SESSION_ID:
-        cmd.extend(["resume", str(SESSION_ID)])
+    def build_cmd(provider: str) -> list[str]:
+        c = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
+        if provider == "custom":
+            # 第三方保底通道：运行时覆盖 model_provider，不改 config.toml
+            c.extend(["-c", 'model_provider="custom"'])
+        if len(image):
+            c.extend(["--image", ",".join(image)])
+        if model:
+            c.extend(["--model", model])
+        if profile:
+            c.extend(["--profile", profile])
+        if yolo:
+            c.append("--yolo")
+        if skip_git_repo_check:
+            c.append("--skip-git-repo-check")
+        if SESSION_ID:
+            c.extend(["resume", str(SESSION_ID)])
+        return c
         
     if os.name == "nt":
         PROMPT = windows_escape(PROMPT)
     else:
         PROMPT = PROMPT
-    cmd += ['--', PROMPT]
-
-    all_messages: list[Dict[str, Any]] = []
-    agent_messages = ""
-    success = True
-    err_message = ""
-    thread_id: Optional[str] = None
 
     # 并发限制：信号量满时直接返回提示，不排队阻塞（MCP 客户端可自行重试）
     if _CODEX_SEMAPHORE is None:
@@ -272,60 +285,71 @@ async def codex(
         }
 
     try:
-        for line in run_shell_command(cmd):
-            try:
-                line_dict = json.loads(line.strip())
-                all_messages.append(line_dict)
-                item = line_dict.get("item", {})
-                item_type = item.get("type", "")
-                if item_type == "agent_message":
-                    agent_messages = agent_messages + item.get("text", "")
-                if line_dict.get("thread_id") is not None:
-                    thread_id = line_dict.get("thread_id")
-                if "fail" in line_dict.get("type", ""):
-                    success = False if len(agent_messages) == 0 else success
-                    err_message += "\n\n[codex error] " + line_dict.get("error", {}).get("message", "")
-                if "error" in line_dict.get("type", ""):
-                    error_msg = line_dict.get("message", "")
-                    import re
-                    is_reconnecting = bool(re.match(r'^Reconnecting\.\.\.\s+\d+/\d+', error_msg))
-                
-                    if not is_reconnecting:
-                        success = False if len(agent_messages) == 0 else success
-                        err_message += "\n\n[codex error] " + error_msg
-                    
-            except json.JSONDecodeError:
-                # import sys
-                # print(f"Ignored non-JSON line: {line}", file=sys.stderr)
-                err_message += "\n\n[json decode error] " + line
-                continue
-            
-            except Exception as error:
-                err_message += "\n\n[unexpected error] " + f"Unexpected error: {error}. Line: {line!r}"
-                success = False
-                break
-
-        if thread_id is None:
-            success = False
-            err_message = "Failed to get `SESSION_ID` from the codex session. \n\n" + err_message
-        
-        if len(agent_messages) == 0:
-            success = False
-            err_message = "Failed to get `agent_messages` from the codex session. \n\n You can try to set `return_all_messages` to `True` to get the full reasoning information. " + err_message
-
-        if success:
-            result: Dict[str, Any] = {
-                "success": True,
-                "SESSION_ID": thread_id,
-                "agent_messages": agent_messages,
-                # "PROMPT": PROMPT,
+        def run_once(provider: str):
+            """单 provider 执行一轮，返回 (result, err_text)。err_text 用于降级判定。"""
+            cmd = build_cmd(provider) + ['--', PROMPT]
+            msgs: list[Dict[str, Any]] = []
+            agent_out = ""
+            ok = True
+            err_parts: list[str] = []
+            tid: Optional[str] = None
+            for line in run_shell_command(cmd):
+                try:
+                    line_dict = json.loads(line.strip())
+                    msgs.append(line_dict)
+                    item = line_dict.get("item", {})
+                    if item.get("type") == "agent_message":
+                        agent_out += item.get("text", "")
+                    if line_dict.get("thread_id") is not None:
+                        tid = line_dict.get("thread_id")
+                    if "fail" in line_dict.get("type", ""):
+                        if len(agent_out) == 0:
+                            ok = False
+                        err_parts.append(line_dict.get("error", {}).get("message", ""))
+                    if "error" in line_dict.get("type", ""):
+                        error_msg = line_dict.get("message", "")
+                        import re
+                        if not re.match(r'^Reconnecting\.\.\.\s+\d+/\d+', error_msg):
+                            if len(agent_out) == 0:
+                                ok = False
+                            err_parts.append(error_msg)
+                except json.JSONDecodeError:
+                    err_parts.append(line)
+                    continue
+                except Exception as error:
+                    err_parts.append(f"Unexpected error: {error}. Line: {line!r}")
+                    ok = False
+                    break
+            if tid is None:
+                ok = False
+                err_parts.insert(0, "Failed to get `SESSION_ID` from the codex session.")
+            if len(agent_out) == 0:
+                ok = False
+                err_parts.insert(0, "Failed to get `agent_messages` from the codex session.")
+            res = {
+                "success": ok,
+                "SESSION_ID": tid,
+                "agent_messages": agent_out,
+                "provider_used": provider,
             }
-        
-        else:
-            result = {"success": False, "error": err_message}
-        
-        if return_all_messages:
-            result["all_messages"] = all_messages
+            if not ok:
+                res["error"] = "\n\n".join(err_parts)
+            if return_all_messages:
+                res["all_messages"] = msgs
+            return res, "\n".join(err_parts)
+
+        # provider 优先级循环：chatgpt（登录额度）优先 → 命中额度/认证类失败时降级 custom（第三方保底）
+        result = None
+        err_text = ""
+        for provider in _provider_order():
+            result, err_text = run_once(provider)
+            if result["success"]:
+                break
+            # resume 属于上一 provider 的会话，降级后无法续（custom 侧无该 thread），自动去掉重开
+            if _should_fallback(err_text) and provider != _provider_order()[-1]:
+                SESSION_ID = ""
+                continue
+            break
 
         return result
     finally:
