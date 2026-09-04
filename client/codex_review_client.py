@@ -383,7 +383,7 @@ def run_test_profile(repo: Path, profile_name: str, cfg: dict) -> dict | None:
     }
 
 
-def build_manifest(repo: Path, collector: Collector, git: dict, tests_meta: list[dict], archive_sha: str, archive_path: Path) -> bytes:
+def build_manifest(repo: Path, collector: Collector, git: dict, tests_meta: list[dict], archive_sha: str, archive_bytes: int = 0) -> bytes:
     name = repo.resolve().name
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -394,7 +394,7 @@ def build_manifest(repo: Path, collector: Collector, git: dict, tests_meta: list
         "snapshot": {
             "file_count": len(collector.files),
             "uncompressed_bytes": sum(f["size"] for f in collector.files),
-            "archive_bytes": archive_path.stat().st_size,
+            "archive_bytes": archive_bytes,
             "archive_sha256": archive_sha,
         },
         "files": [{"path": f["path"], "size": f["size"], "sha256": f["sha256"]} for f in collector.files],
@@ -456,27 +456,24 @@ def make_bundle(repo: Path, output: Path, base_ref: str | None, test_profile: st
             ti = norminfo("meta/manifest.json", len(manifest_data))
             tf.addfile(ti, io.BytesIO(manifest_data))
 
-        # stage1：manifest 不含 archive hash（占位）
-        m1 = build_manifest(repo, collector, git, tests_meta, "PLACEHOLDER", stage1)
+        # stage1：manifest 占位打包（算体积）
+        m1 = build_manifest(repo, collector, git, tests_meta, "PLACEHOLDER", 0)
         with tarfile.open(stage1, "w:gz", compresslevel=6) as tf:
             add_tree(tf, m1)
-        sha1 = hashlib.sha256(stage1.read_bytes()).hexdigest()
 
-        # stage2：回填真实 hash 重打包（gzip 时间戳非确定性，hash 必然变化 → 以 stage2 为准）
-        final = tmpdir / "final.tar.gz"
-        m2 = build_manifest(repo, collector, git, tests_meta, sha1, stage1)
-        # manifest 的 archive_sha256 指向 stage1 但最终包是 stage2 —— 自引用不可能精确，
-        # 规范改为：manifest 记录 snapshot 文件集合的 merkle（文件级 hash 已在 files[] 中），
-        # archive_sha256 由上传表单单独携带（中心双端校验），manifest 内省略该字段。
-        m2_obj = json.loads(m2)
+        # 注：manifest 自引用 archive_sha256 不可能精确（gzip 非确定性）——
+        # 文件级 hash 已在 files[] 中构成内容指纹，archive_sha256 由上传表单
+        # 单独携带并双端校验，manifest 内省略该字段。
+        m2_obj = json.loads(m1)
         m2_obj["snapshot"].pop("archive_sha256", None)
         m2_obj["snapshot"]["archive_sha256_note"] = "carried in upload form field, verified server-side"
+        m2_obj["snapshot"]["archive_bytes"] = stage1.stat().st_size
         m2 = json.dumps(m2_obj, ensure_ascii=False, indent=1).encode()
+        final = tmpdir / "final.tar.gz"
         with tarfile.open(final, "w:gz", compresslevel=6) as tf:
             add_tree(tf, m2)
         final_sha = hashlib.sha256(final.read_bytes()).hexdigest()
         shutil.move(str(final), str(output))
-        (tmpdir / "review-bundle.tar.gz").unlink(missing_ok=True)
         return {
             "output": output,
             "archive_bytes": output.stat().st_size,

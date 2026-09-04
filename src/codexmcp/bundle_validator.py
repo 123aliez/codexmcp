@@ -88,10 +88,11 @@ def _validate_file_hashes(tf: tarfile.TarFile, manifest: dict, limits_hit: dict)
     seen_ws: set[str] = set()
     for member in tf.getmembers():
         rel = member.name.removeprefix(_BUNDLE_ROOT + "/")
-        if not rel.startswith("workspace/"):
+        if not rel.startswith("workspace/") or not member.isfile():
             continue
         ws_rel = rel.removeprefix("workspace/")
         _check_member_path(member.name, seen_ws)
+        seen_ws.add(ws_rel)
         d = declared.get(ws_rel)
         if d is None:
             raise ValidationError("MANIFEST_INVALID", f"archive file not in manifest: {ws_rel}")
