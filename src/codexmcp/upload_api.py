@@ -99,7 +99,9 @@ async def uploads_endpoint(request: Request) -> JSONResponse:
         client_meta = json.loads(client_meta_raw) if isinstance(client_meta_raw, str) else {}
     except json.JSONDecodeError:
         client_meta = {}
-    db_upload_id = storage.new_upload(token_id, str(staging), actual_sha, UPLOAD_TTL)
+    upload_id = storage.new_upload(token_id, str(ready_path := workspace_manager.ready_path(f"_tmp_{_rand_hex()}")), actual_sha, UPLOAD_TTL)
+    # ↑ 先拿 DB 分配的 upload_id；archive_path 稍后用最终 ready 路径回写
+    _ = ready_path
 
     # 7. 安全校验（tar 逐项检查 + manifest 对账 + 敏感二次检测）——校验只读包，
     #    解出的临时校验目录用完即删（workspace 在 review 启动时才正式解出）
@@ -115,11 +117,11 @@ async def uploads_endpoint(request: Request) -> JSONResponse:
         shutil.rmtree(tmp_ws, ignore_errors=True)
 
     # 8. 换名原子移动到 ready（DB 分配的 upload_id）+ 登记 READY（无 VALIDATING 残留）
-    upload_id = db_upload_id
     ready = workspace_manager.ready_path(upload_id)
     os.replace(staging, ready)
     storage.set_upload_state(
         upload_id, "READY",
+        archive_path=str(ready),
         project_name=str(manifest.get("project_name", ""))[:200],
         file_count=int(manifest.get("snapshot", {}).get("file_count", 0)),
         compressed_bytes=Path(ready).stat().st_size,
