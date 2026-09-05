@@ -44,9 +44,12 @@ def _provider_order() -> list[str]:
 
 
 def _cd_allowed(cd: Path) -> bool:
-    """cd 参数 allowlist（容器化部署：仅允许挂载的工作区内），逗号分隔环境变量 CODEX_CD_ALLOWLIST 可覆盖。
+    """cd 参数 allowlist（容器化部署：仅允许挂载的工作区内），分隔符支持逗号或冒号。
     审查修复：resolve 后用 is_relative_to 判定，防 .. 与符号链接逃逸。"""
-    allowlist = [p.strip() for p in os.getenv("CODEX_CD_ALLOWLIST", "/workspace").split(",") if p.strip()]
+    raw = os.getenv("CODEX_CD_ALLOWLIST", "/workspace")
+    import re as _re
+    allowlist = [p.strip() for p in _re.split(r"[,:]", raw) if p.strip()]
+    # Windows 盘符形如 C:\ 不做拆分（本项目面向 Linux 容器部署，仅防御性保留说明）
     try:
         real_cd = Path(cd).resolve(strict=True)
     except (OSError, RuntimeError):
