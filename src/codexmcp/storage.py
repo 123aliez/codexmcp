@@ -106,14 +106,40 @@ def get_upload(upload_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def claim_ready_upload(upload_id: str, token_id: str) -> tuple[dict | None, str]:
+    """原子占用 READY upload（审查修复#5：SELECT-then-UPDATE 竞态改为条件更新 CAS）。
+    只有 state=READY 且未过期且归属该 token 时才转为 REVIEWING 并返回记录。"""
+    now = time.time()
+    with _DB_LOCK:
+        conn = _connect()
+        cur = conn.execute(
+            "UPDATE uploads SET state='REVIEWING' WHERE upload_id=? AND token_id=? AND state='READY' AND expires_at>?",
+            (upload_id, token_id, now),
+        )
+        if cur.rowcount != 1:
+            conn.commit()
+            # 占用失败：区分原因供调用方返回准确错误
+            row = conn.execute("SELECT state, token_id, expires_at FROM uploads WHERE upload_id=?", (upload_id,)).fetchone()
+            if row is None:
+                return None, "UPLOAD_NOT_FOUND"
+            if row["token_id"] != token_id:
+                return None, "UPLOAD_FORBIDDEN"
+            if row["state"] in ("EXPIRED", "PURGED", "REVIEWING") or row["expires_at"] <= now:
+                return None, "UPLOAD_EXPIRED"
+            return None, "UPLOAD_NOT_READY"
+        row = conn.execute("SELECT * FROM uploads WHERE upload_id=?", (upload_id,)).fetchone()
+        conn.commit()
+    return dict(row), ""
+
+
 def get_ready_upload(upload_id: str, token_id: str) -> tuple[dict | None, str]:
-    """取 READY 且未过期且归属该 token 的 upload；返回 (upload, error_code)。"""
+    """（保留：只读检查，不占用）取 READY 且未过期且归属该 token 的 upload。"""
     up = get_upload(upload_id)
     if up is None:
         return None, "UPLOAD_NOT_FOUND"
     if up["token_id"] != token_id:
         return None, "UPLOAD_FORBIDDEN"          # 跨 Token 使用（方案 §12）
-    if up["state"] == "EXPIRED" or up["state"] == "PURGED":
+    if up["state"] in ("EXPIRED", "PURGED"):
         return None, "UPLOAD_EXPIRED"
     if up["state"] != "READY":
         return None, "UPLOAD_NOT_READY"
@@ -173,19 +199,29 @@ def touch_review(review_id: str, idle_ttl: float, **cols) -> None:
 
 
 def list_stale_uploads(ttl: float) -> list[dict]:
-    """READY 超过 ttl 未使用 / 任意异常残留的 uploads（清理器输入）。"""
+    """需要清理的 uploads（审查修复#7：覆盖全部非终态/失败态，不留永久残留）。"""
+    now = time.time()
     with _DB_LOCK:
         rows = _connect().execute(
-            "SELECT * FROM uploads WHERE state IN ('READY','VALIDATING') AND expires_at < ?", (time.time(),)
+            "SELECT * FROM uploads WHERE "
+            # READY/VALIDATING 超时
+            "((state IN ('READY','VALIDATING')) AND expires_at < ?) OR "
+            # REVIEWING 但没有对应活动 review（孤儿，如容器崩溃中断）
+            "(state='REVIEWING' AND upload_id NOT IN (SELECT upload_id FROM reviews WHERE state='REVIEWING')) OR "
+            # 失败态给 10 分钟保留期（排查窗口）后清理
+            "(state='REJECTED' AND created_at < ?)",
+            (now, now - 600),
         ).fetchall()
     return [dict(r) for r in rows]
 
 
 def list_stale_reviews(idle_ttl: float) -> list[dict]:
+    """需要清理的 reviews（审查修复#7：含 FAILED，不留永久残留源码）。"""
     cutoff = time.time() - idle_ttl
     with _DB_LOCK:
         rows = _connect().execute(
-            "SELECT * FROM reviews WHERE state IN ('REVIEWING','COMPLETED') AND (last_active < ? OR hard_deadline < ?)",
+            "SELECT * FROM reviews WHERE state IN ('REVIEWING','COMPLETED','FAILED') "
+            "AND (last_active < ? OR hard_deadline < ?)",
             (cutoff, time.time()),
         ).fetchall()
     return [dict(r) for r in rows]

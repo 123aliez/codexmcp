@@ -63,37 +63,54 @@ def create_review_dirs(review_id: str) -> tuple[Path, Path]:
 
 
 def purge_review(review_id: str, also_upload: bool = False, upload_id: str = "") -> None:
-    """删除 review 目录（+可选 upload 包）。目录删完才标记 PURGED。"""
+    """删除 review 目录（+可选 upload 包）。
+    审查修复#8：删除失败不标 PURGED——目录仍存在时保持原状态，下一轮清理重试。"""
     d = REVIEW_ROOT / review_id
     shutil.rmtree(d, ignore_errors=True)
+    if d.exists():  # 删除失败：不标 PURGED，留待重试
+        return
     if also_upload and upload_id:
-        for p in (ready_path(upload_id), staging_path(upload_id)):
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _purge_upload_files(upload_id)
         storage.mark_purged("upload", upload_id)
     storage.mark_purged("review", review_id)
 
 
-def purge_upload(upload_id: str) -> None:
+def _purge_upload_files(upload_id: str) -> bool:
+    """删除 upload 包文件；全部确认消失返回 True。"""
+    ok = True
     for p in (ready_path(upload_id), staging_path(upload_id)):
         try:
             p.unlink(missing_ok=True)
         except OSError:
-            pass
+            ok = False
+    return ok
+
+
+def purge_upload(upload_id: str) -> None:
+    _purge_upload_files(upload_id)
 
 
 def startup_orphan_cleanup() -> None:
-    """容器启动清孤儿：目录里存在但 DB 无有效记录的，直接删（防异常中断残留源码）。"""
+    """容器启动清孤儿（审查修复#8：含 PURGED/EXPIRED/REJECTED/FAILED 记录的残留路径重删）。"""
     ensure_dirs()
-    known_uploads = {r["upload_id"] for r in _all_uploads()}
+    uploads = _all_uploads()
+    known_uploads = {r["upload_id"] for r in uploads}
+    # 终态记录：文件应已不存在，残留即上次删除失败——重删
+    dead_uploads = {r["upload_id"] for r in uploads if r["state"] in ("PURGED", "EXPIRED", "REJECTED")}
+    for uid in dead_uploads:
+        _purge_upload_files(uid)
     for sub in ("staging", "ready"):
         for f in (UPLOAD_ROOT / sub).glob("*.tar.gz"):
             uid = f.name.removesuffix(".tar.gz")
             if uid not in known_uploads:
                 f.unlink(missing_ok=True)
-    known_reviews = {r["review_id"] for r in _all_reviews()}
+    reviews = _all_reviews()
+    known_reviews = {r["review_id"] for r in reviews}
+    for rv in reviews:
+        if rv["state"] in ("PURGED", "FAILED"):
+            d = REVIEW_ROOT / rv["review_id"]
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
     for d in REVIEW_ROOT.iterdir():
         if d.is_dir() and d.name not in known_reviews:
             shutil.rmtree(d, ignore_errors=True)

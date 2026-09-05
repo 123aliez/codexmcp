@@ -92,7 +92,9 @@ def _iso(ts: float) -> str:
 
 def _run_codex_once(cd: Path, prompt: str, session_id: str, return_all: bool) -> Dict[str, Any]:
     """复用 server.py 的 codex exec 机制（含 provider 降级），固定 workspace-only 参数。
-    与 server.codex() 的差异：cd/sandbox/yolo/model/profile 全部固定，客户端不可指定。"""
+    与 server.codex() 的差异：cd/sandbox/yolo/model/profile 全部固定，客户端不可指定。
+    审查修复#3：run_shell_command 外层加 watchdog 线程，硬超时 CODEX_TIMEOUT 秒后 kill 进程组，
+    防止 codex 挂起永久占用信号量。"""
     from .server import _provider_order, _should_fallback, build_review_cmd
 
     def run_once(provider: str):
@@ -102,9 +104,42 @@ def _run_codex_once(cd: Path, prompt: str, session_id: str, return_all: bool) ->
         ok = True
         err_parts: list[str] = []
         tid = None
-        for line in run_shell_command(cmd):
+        timed_out = False
+
+        import subprocess as _sp
+        import shutil as _shutil
+        codex_path = _shutil.which('codex') or cmd[0]
+        full_cmd = [codex_path] + cmd[1:]
+        proc = _sp.Popen(full_cmd, shell=False, stdin=_sp.DEVNULL,
+                         stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                         universal_newlines=True, encoding='utf-8',
+                         start_new_session=True)  # 进程组：kill 时连子孙进程一起收
+        import threading as _th
+
+        def _kill_on_timeout():
+            nonlocal timed_out
+            if proc.wait(timeout=CODEX_TIMEOUT):
+                return
+        # watchdog：超时 kill 整个进程组
+        def _watchdog():
+            nonlocal timed_out
             try:
-                line_dict = json.loads(line.strip())
+                proc.wait(timeout=CODEX_TIMEOUT)
+            except _sp.TimeoutExpired:
+                timed_out = True
+                try:
+                    import signal as _sig
+                    os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)
+                except (OSError, PermissionError):
+                    proc.kill()
+        _th.Thread(target=_watchdog, daemon=True).start()
+
+        for line in iter(proc.stdout.readline, ""):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                line_dict = json.loads(line)
                 msgs.append(line_dict)
                 item = line_dict.get("item", {})
                 if item.get("type") == "agent_message":
@@ -125,17 +160,25 @@ def _run_codex_once(cd: Path, prompt: str, session_id: str, return_all: bool) ->
             except json.JSONDecodeError:
                 err_parts.append(line)
                 continue
+        proc.stdout.close()
+        try:
+            proc.wait(timeout=10)
+        except _sp.TimeoutExpired:
+            proc.kill()
+        if timed_out:
+            ok = False
+            err_parts.insert(0, f"codex timed out after {CODEX_TIMEOUT}s (killed)")
         if tid is None:
             ok = False
             err_parts.insert(0, "Failed to get SESSION_ID from codex session.")
         if len(agent_out) == 0:
             ok = False
             err_parts.insert(0, "Failed to get agent_messages from codex session.")
-        res = {"success": ok, "SESSION_ID": tid, "agent_messages": agent_out, "provider_used": provider}
+        res = {"success": ok, "SESSION_ID": tid, "agent_messages": agent_out[:200000], "provider_used": provider}
         if not ok:
-            res["error"] = "\n\n".join(err_parts)
+            res["error"] = "\n\n".join(err_parts)[:5000]
         if return_all:
-            res["all_messages"] = msgs
+            res["all_messages"] = msgs[-2000:]  # 审查修复#10：输出上限
         return res, "\n".join(err_parts)
 
     result = None
@@ -167,7 +210,7 @@ async def codex_project_review(
     token_id = _current_token_id()
     if not token_id:
         return {"success": False, "error": "缺少请求身份（X-Authenticated-Token-Id），无法审计归属"}
-    upload, err = storage.get_ready_upload(upload_id, token_id)
+    upload, err = storage.claim_ready_upload(upload_id, token_id)  # 审查修复#5：CAS 原子占用
     if upload is None:
         return {"success": False, "error": f"upload 不可用: {err}", "error_code": err}
 
@@ -195,10 +238,16 @@ async def codex_project_review(
         # 解包（已通过上传时校验，此处再做一次快速完整性校验防包被替换）
         archive = Path(upload["archive_path"])
         if not archive.exists():
+            workspace_manager.purge_review(review_id)  # 审查修复#7：失败路径不留半成品目录
             storage.set_upload_state(upload_id, "EXPIRED", "ARCHIVE_MISSING")
             return {"success": False, "error": "upload 包已不存在（可能已过期清理），请重新上传", "error_code": "UPLOAD_EXPIRED"}
         import hashlib
-        if hashlib.sha256(archive.read_bytes()).hexdigest() != upload["archive_sha256"]:
+        h = hashlib.sha256()
+        with open(archive, "rb") as f:  # 审查修复#10：分块算 hash，不整包进内存
+            for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                h.update(chunk)
+        if h.hexdigest() != upload["archive_sha256"]:
+            workspace_manager.purge_review(review_id)
             storage.set_upload_state(upload_id, "REJECTED", "ARCHIVE_MUTATED")
             return {"success": False, "error": "upload 包 hash 不符（被替换？），已拒绝", "error_code": "ARCHIVE_SHA256_MISMATCH"}
         try:
@@ -229,6 +278,8 @@ async def codex_project_review(
             workspace_manager.purge_upload(upload_id)
             storage.set_upload_state(upload_id, "PURGED", "CONSUMED")
         else:
+            # 审查修复#7：失败也删 workspace（复审本来就要重新上传快照），只留 DB 记录
+            workspace_manager.purge_review(review_id, also_upload=True, upload_id=upload_id)
             storage.touch_review(review_id, REVIEW_IDLE_TTL,
                                  agent_text=result.get("agent_messages", "")[:200000],
                                  state="FAILED", error_code="CODEX_ERROR")
