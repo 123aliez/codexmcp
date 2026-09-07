@@ -231,6 +231,24 @@ claude mcp list
 
 </details>
 
+<details>
+<summary>点击查看远程完整项目审查工具（remote-review 分支新增）</summary>
+
+为「项目在其他机器、Codex 集中部署在中心服务器」的场景设计：客户端把**完整项目快照**（源码 + git diff + 本地测试输出）打包上传，中央 Codex 在临时 workspace 审查，结束即删。中心不 SSH 客户端、客户端不装 Codex。
+
+| 工具 | 说明 |
+|------|------|
+| `codex_project_review(upload_id, PROMPT, mode)` | 发起审查（**异步**：秒级返回 review_id，审查 1-5 分钟后台进行）。mode: review / debug（结合客户端测试失败定位根因）/ test-analysis |
+| `codex_review_status(review_id)` | 轮询状态：REVIEWING=进行中 / COMPLETED=领取完整报告 / FAILED=看 error |
+| `codex_project_continue(review_id, PROMPT)` | 同一快照续问（恢复 Codex 会话；代码改了须重新上传） |
+| `codex_project_finalize(review_id)` | 立即删除中心侧全部临时源码 |
+
+配套客户端工具（纯 Python 标准库单文件，`client/codex_review_client.py`，支持 inspect/bundle/upload 三命令）随服务端镜像分发：`GET /codex-remote/client.py`。安全设计：tar 逐项校验（路径穿越/符号链接/解压炸弹/敏感文件/manifest 对账）、upload_id 绑定 Token、TTL 自动清理、客户端不可指定 sandbox/yolo/model。
+
+完整部署方案（Nginx 网关 + Docker + 管理界面）见配套仓库 [mcp-center](https://github.com/123aliez/mcp-center)。
+
+</details>
+
 ---
 
 ## 四、FAQ
