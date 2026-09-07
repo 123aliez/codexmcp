@@ -104,11 +104,14 @@ async def uploads_endpoint(request: Request) -> JSONResponse:
     _ = ready_path
 
     # 7. 安全校验（tar 逐项检查 + manifest 对账 + 敏感二次检测）——校验只读包，
-    #    解出的临时校验目录用完即删（workspace 在 review 启动时才正式解出）
+    #    解出的临时校验目录用完即删（workspace 在 review 启动时才正式解出）。
+    #    CPU/IO 密集，挪线程池防阻塞事件循环（与 review 工具同款修复）
     tmp_ws = staging.parent / f".validate-{staging_id}"
     tmp_meta = tmp_ws / "meta"
     try:
-        manifest = bundle_validator.validate_and_extract(staging, tmp_ws / "workspace", tmp_meta)
+        import asyncio
+        manifest = await asyncio.to_thread(
+            bundle_validator.validate_and_extract, staging, tmp_ws / "workspace", tmp_meta)
     except bundle_validator.ValidationError as e:
         staging.unlink(missing_ok=True)
         return _err(e.code, e.message)

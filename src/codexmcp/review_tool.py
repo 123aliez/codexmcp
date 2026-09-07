@@ -268,7 +268,10 @@ async def codex_project_review(
         prompt += "\n\n报告固定结构：一、结论摘要；二、阻断级问题；三、高优先级问题；四、中低优先级问题；五、Bug 根因与证据；六、测试结果分析；七、建议修改方案/Unified Diff；八、审查覆盖范围；九、未能验证的剩余风险。每个问题包含：严重等级/文件路径/行号或符号/描述/触发条件/影响/证据/修复建议。"
 
         t0 = time.monotonic()
-        result = _run_codex_once(ws, prompt, "", return_all_messages)
+        # 自审#4 实测踩雷修复：codex 同步跑几分钟会独占事件循环 → healthz 超时 unhealthy、
+        # SSE 心跳停摆 → 客户端判超时丢结果（"[Tool result missing]"）。挪进默认线程池。
+        import asyncio
+        result = await asyncio.to_thread(_run_codex_once, ws, prompt, "", return_all_messages)
         dur = round(time.monotonic() - t0, 1)
 
         changed = _changed_files(meta_dir)
@@ -337,7 +340,8 @@ async def codex_project_continue(
         if not ws.is_dir():
             return {"success": False, "error": "workspace 已清理，请重新上传快照", "error_code": "REVIEW_EXPIRED"}
         prompt = _SYSTEM_CONSTRAINTS + "这是同一快照的后续追问，继续基于当前 workspace 分析。\n\n用户追问：" + PROMPT
-        result = _run_codex_once(ws, prompt, rv.get("codex_session") or "", return_all_messages)
+        import asyncio
+        result = await asyncio.to_thread(_run_codex_once, ws, prompt, rv.get("codex_session") or "", return_all_messages)
         if result["success"]:
             storage.touch_review(review_id, REVIEW_IDLE_TTL,
                                  codex_session=result.get("SESSION_ID") or rv.get("codex_session", ""),
