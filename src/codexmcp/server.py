@@ -421,6 +421,20 @@ def run() -> None:
             from starlette.responses import JSONResponse
             return JSONResponse({"status": "ok", "remote_review": True})
 
+        # 客户端工具分发：curl 一个命令拿到（随镜像打包，来源可信）
+        @mcp.custom_route("/client.py", methods=["GET"])
+        async def _client_py(request):
+            from starlette.responses import PlainTextResponse
+            try:
+                src = open("/app/codex_review_client.py", "rb").read()
+            except OSError:
+                return PlainTextResponse("client script not bundled in this image", status_code=404)
+            return PlainTextResponse(
+                src.decode("utf-8"),
+                media_type="text/x-python",
+                headers={"Content-Disposition": 'attachment; filename="codex_review_client.py"'},
+            )
+
         workspace_manager.start_background_cleanup()
 
         mcp.run(transport="streamable-http")

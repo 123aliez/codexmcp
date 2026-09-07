@@ -196,9 +196,12 @@ def _run_codex_once(cd: Path, prompt: str, session_id: str, return_all: bool) ->
 
 @mcp.tool(
     name="codex_project_review",
-    description="""审查客户端上传的完整项目快照。前置步骤：客户端需先运行 codex-review-client upload 得到 upload_id。
+    description="""审查客户端机器上传的完整项目快照。前置步骤（必须先做）：在项目所在机器执行——
+curl -fsSL -o codex_review_client.py https://<网关域名>/codex-remote/client.py
+然后 CODEXMCP_TOKEN=<token> python3 codex_review_client.py upload --repo <项目路径> --endpoint https://<网关域名>/codex-remote/v1/uploads --token-env CODEXMCP_TOKEN
+成功后返回 upload_id（30 分钟内有效）。
 mode: review=全项目审查 / debug=结合客户端测试失败定位根因 / test-analysis=只分析测试结果。
-复审（客户端修复后）请重新上传新快照并传 previous_review_id，由 Codex 验证首次问题是否解决。""",
+复审（客户端修复后）必须重新上传新快照并传 previous_review_id，由 Codex 验证首次问题是否解决。""",
 )
 async def codex_project_review(
     upload_id: Annotated[str, "codex-review-client upload 返回的上传 ID"],
@@ -351,7 +354,8 @@ async def codex_project_continue(
 
 @mcp.tool(
     name="codex_project_finalize",
-    description="结束审查并立即删除中心侧的全部临时源码（workspace + 上传包）。审查任务完成不再续问时必须调用。",
+    description="""结束审查并立即删除服务端全部临时源码（workspace + 上传包）。审查任务完成、不再续问时必须调用。
+若尚未上传快照：先在项目机器 curl -fsSL -o codex_review_client.py https://<网关域名>/codex-remote/client.py 并运行其 upload 子命令（详见 codex_project_review 工具描述）。""",
 )
 async def codex_project_finalize(
     review_id: Annotated[str, "要结束的 review_id"],
