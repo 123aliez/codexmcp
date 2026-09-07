@@ -52,6 +52,9 @@ _MODE_HINTS = {
 _PER_CLIENT_REVIEW_SEMAPHORE: dict[str, threading.Semaphore] = {}
 _PCP_LOCK = threading.Lock()
 
+# 异步审查完成结果暂存（review_id → 交付给 codex_review_status 的完整输出；DB 是回退源）
+_LAST_RESULTS: dict[str, Dict[str, Any]] = {}
+
 
 def _current_token_id() -> str:
     """MCP 工具调用发生在 streamable-http 请求处理中：lowlevel Server 把 starlette Request
@@ -196,10 +199,12 @@ def _run_codex_once(cd: Path, prompt: str, session_id: str, return_all: bool) ->
 
 @mcp.tool(
     name="codex_project_review",
-    description="""审查客户端机器上传的完整项目快照。前置步骤（必须先做）：在项目所在机器执行——
+    description="""审查客户端机器上传的完整项目快照（异步：立即返回 review_id，审查 1-5 分钟后台进行）。
+前置步骤（必须先做）：在项目所在机器执行——
 curl -fsSL -o codex_review_client.py https://<网关域名>/codex-remote/client.py
 然后 CODEXMCP_TOKEN=<token> python3 codex_review_client.py upload --repo <项目路径> --endpoint https://<网关域名>/codex-remote/v1/uploads --token-env CODEXMCP_TOKEN
 成功后返回 upload_id（30 分钟内有效）。
+返回 review_id 后用 codex_review_status(review_id) 每 20-30 秒轮询，COMPLETED 时领取完整报告。
 mode: review=全项目审查 / debug=结合客户端测试失败定位根因 / test-analysis=只分析测试结果。
 复审（客户端修复后）必须重新上传新快照并传 previous_review_id，由 Codex 验证首次问题是否解决。""",
 )
@@ -221,6 +226,7 @@ async def codex_project_review(
     if previous_review_id:
         prev, perr = storage.get_review(previous_review_id, token_id)
         if prev is None:
+            storage.set_upload_state(upload_id, "READY")  # 归还占用，客户端可换正确的 prev 重试
             return {"success": False, "error": f"previous_review_id 不可用: {perr}"}
         prev_summary = (prev.get("agent_text") or "")[:60000]
 
@@ -229,11 +235,16 @@ async def codex_project_review(
     if _CODEX_SEMAPHORE is None:
         _CODEX_SEMAPHORE = threading.Semaphore(2)
     if not _CODEX_SEMAPHORE.acquire(blocking=False):
+        storage.set_upload_state(upload_id, "READY")
         return {"success": False, "error": "全局并发已满，请稍后重试", "error_code": "BUSY"}
     slot = _per_client_slot(token_id)
     if not slot.acquire(blocking=False):
         _CODEX_SEMAPHORE.release()
+        storage.set_upload_state(upload_id, "READY")
         return {"success": False, "error": "该客户端已有审查任务在运行（每客户端并发 1），请稍后重试", "error_code": "BUSY"}
+
+    # 解包与校验（快，秒级）：同步完成后即返回 review_id；codex 执行（慢，分钟级）转后台线程
+    review_id = ""
     try:
         # 先向 DB 登记（由 DB 分配 review_id），再用同一 ID 建目录——保证目录名与 DB 一致
         review_id = storage.new_review(upload, "<pending>", mode, previous_review_id, REVIEW_HARD_TTL)
@@ -261,53 +272,114 @@ async def codex_project_review(
             return {"success": False, "error": f"包校验失败: {e.message}", "error_code": e.code}
 
         storage.set_review_workspace(review_id, str(ws))
-
-        prompt = _SYSTEM_CONSTRAINTS + _MODE_HINTS.get(mode, _MODE_HINTS["review"]) + "\n\n用户指令：" + PROMPT
-        if prev_summary:
-            prompt += f"\n\n上一轮审查结论（验证这些问题是否已解决，并检查是否引入新问题）：\n{prev_summary[:30000]}"
-        prompt += "\n\n报告固定结构：一、结论摘要；二、阻断级问题；三、高优先级问题；四、中低优先级问题；五、Bug 根因与证据；六、测试结果分析；七、建议修改方案/Unified Diff；八、审查覆盖范围；九、未能验证的剩余风险。每个问题包含：严重等级/文件路径/行号或符号/描述/触发条件/影响/证据/修复建议。"
-
-        t0 = time.monotonic()
-        # 自审#4 实测踩雷修复：codex 同步跑几分钟会独占事件循环 → healthz 超时 unhealthy、
-        # SSE 心跳停摆 → 客户端判超时丢结果（"[Tool result missing]"）。挪进默认线程池。
-        import asyncio
-        result = await asyncio.to_thread(_run_codex_once, ws, prompt, "", return_all_messages)
-        dur = round(time.monotonic() - t0, 1)
-
-        changed = _changed_files(meta_dir)
-        if result["success"]:
-            storage.touch_review(review_id, REVIEW_IDLE_TTL,
-                                 codex_session=result.get("SESSION_ID") or "",
-                                 agent_text=result["agent_messages"][:200000],
-                                 state="COMPLETED", error_code="")
-            # 审查完成的包不再需要（workspace 已解出）——立即删包，只留 workspace 供续问
-            workspace_manager.purge_upload(upload_id)
-            storage.set_upload_state(upload_id, "PURGED", "CONSUMED")
-        else:
-            # 审查修复#7：失败也删 workspace（复审本来就要重新上传快照），只留 DB 记录
-            workspace_manager.purge_review(review_id, also_upload=True, upload_id=upload_id)
-            storage.touch_review(review_id, REVIEW_IDLE_TTL,
-                                 agent_text=result.get("agent_messages", "")[:200000],
-                                 state="FAILED", error_code="CODEX_ERROR")
-
-        out = dict(result)
-        hard_deadline = time.time() + REVIEW_HARD_TTL
-        rv_now, _ = storage.get_review(review_id, token_id)
-        if rv_now:
-            hard_deadline = rv_now["hard_deadline"]
-        out.update({
-            "review_id": review_id,
-            "workspace_expires_at": _iso(hard_deadline),
-            "coverage": {
-                "snapshot_files": int(manifest.get("snapshot", {}).get("file_count", 0)),
-                "changed_files": changed,
-                "duration_seconds": dur,
-            },
-        })
-        return out
-    finally:
+        snapshot_files = int(manifest.get("snapshot", {}).get("file_count", 0))
+    except Exception as e:  # noqa: 解包阶段意外异常：清理并归还
+        if review_id:
+            workspace_manager.purge_review(review_id)
+        storage.set_upload_state(upload_id, "REJECTED", f"PREPARE_ERROR:{e}")
         slot.release()
         _CODEX_SEMAPHORE.release()
+        return {"success": False, "error": f"审查准备阶段失败: {e}", "error_code": "INTERNAL_ERROR"}
+
+    # ── 异步模式：立即返回 review_id，codex 在后台线程执行 ──
+    # 信号量移交后台线程释放（函数返回时不释放——任务还在跑）
+    prompt = _SYSTEM_CONSTRAINTS + _MODE_HINTS.get(mode, _MODE_HINTS["review"]) + "\n\n用户指令：" + PROMPT
+    if prev_summary:
+        prompt += f"\n\n上一轮审查结论（验证这些问题是否已解决，并检查是否引入新问题）：\n{prev_summary[:30000]}"
+    prompt += "\n\n报告固定结构：一、结论摘要；二、阻断级问题；三、高优先级问题；四、中低优先级问题；五、Bug 根因与证据；六、测试结果分析；七、建议修改方案/Unified Diff；八、审查覆盖范围；九、未能验证的剩余风险。每个问题包含：严重等级/文件路径/行号或符号/描述/触发条件/影响/证据/修复建议。"
+
+    def _bg_review():
+        t0 = time.monotonic()
+        try:
+            result = _run_codex_once(ws, prompt, "", return_all_messages)
+            dur = round(time.monotonic() - t0, 1)
+            changed = _changed_files(meta_dir)
+            if result["success"]:
+                storage.touch_review(review_id, REVIEW_IDLE_TTL,
+                                     codex_session=result.get("SESSION_ID") or "",
+                                     agent_text=result["agent_messages"][:200000],
+                                     state="COMPLETED", error_code="")
+                # 审查完成的包不再需要（workspace 已解出）——立即删包，只留 workspace 供续问
+                workspace_manager.purge_upload(upload_id)
+                storage.set_upload_state(upload_id, "PURGED", "CONSUMED")
+            else:
+                # 审查修复#7：失败也删 workspace（复审本来就要重新上传快照），只留 DB 记录
+                workspace_manager.purge_review(review_id, also_upload=True, upload_id=upload_id)
+                storage.touch_review(review_id, REVIEW_IDLE_TTL,
+                                     agent_text=result.get("agent_messages", "")[:200000],
+                                     state="FAILED", error_code="CODEX_ERROR")
+            out = dict(result)
+            out.update({
+                "review_id": review_id,
+                "duration_seconds": dur,
+                "coverage": {"snapshot_files": snapshot_files, "changed_files": changed},
+            })
+            _LAST_RESULTS[review_id] = out  # 完成结果暂存，status 首次拉取时交付
+        except Exception as e:  # noqa: 后台线程兜底，绝不让信号量泄漏
+            workspace_manager.purge_review(review_id, also_upload=True, upload_id=upload_id)
+            storage.touch_review(review_id, REVIEW_IDLE_TTL, state="FAILED", error_code=f"INTERNAL_ERROR:{e}")
+            _LAST_RESULTS[review_id] = {"success": False, "error": str(e), "review_id": review_id}
+        finally:
+            slot.release()
+            _CODEX_SEMAPHORE.release()
+
+    threading.Thread(target=_bg_review, name=f"codex-review-{review_id[:12]}", daemon=True).start()
+
+    return {
+        "success": True,
+        "submitted": True,          # 新语义：任务已受理，结果稍后经 codex_review_status 领取
+        "review_id": review_id,
+        "state": "REVIEWING",
+        "note": "审查已在后台启动（全项目通常 1-5 分钟）。用 codex_review_status(review_id) 轮询，COMPLETED 时返回完整报告。",
+        "workspace_expires_at": _iso(time.time() + REVIEW_HARD_TTL),
+        "coverage": {"snapshot_files": snapshot_files},
+    }
+
+
+@mcp.tool(
+    name="codex_review_status",
+    description="""查询审查任务状态并领取结果。codex_project_review 返回 review_id 后，轮询本工具直到 state=COMPLETED/FAILED。
+REVIEWING=审查进行中（继续等，全项目审查 1-5 分钟属正常，建议 20-30 秒后再查）；
+COMPLETED=完成，本响应内含完整审查报告（agent_messages）；
+FAILED=失败（error 字段说明原因）。
+continue/finalize 仍用原工具，语义不变。""",
+)
+async def codex_review_status(
+    review_id: Annotated[str, "codex_project_review 返回的 review_id"],
+) -> Dict[str, Any]:
+    token_id = _current_token_id()
+    if not token_id:
+        return {"success": False, "error": "缺少请求身份，无法审计归属"}
+    rv, err = storage.get_review(review_id, token_id)
+    if rv is None:
+        return {"success": False, "error": f"review 不可用: {err}", "error_code": err}
+    state = rv["state"]
+    elapsed = round(time.time() - rv["created_at"], 1)
+    if state == "REVIEWING":
+        return {
+            "success": True, "review_id": review_id, "state": "REVIEWING",
+            "elapsed_seconds": elapsed,
+            "note": "审查进行中，请 20-30 秒后再查",
+        }
+    # 完成或失败：交付结果（优先内存暂存——含 coverage/duration；回退 DB agent_text）
+    out = _LAST_RESULTS.pop(review_id, None)
+    if out is None:
+        out = {
+            "success": state == "COMPLETED",
+            "review_id": review_id,
+            "state": state,
+            "agent_messages": (rv.get("agent_text") or ""),
+            "SESSION_ID": rv.get("codex_session") or "",
+            "error_code": rv.get("error_code") or None,
+        }
+        if state != "COMPLETED" and not out.get("error"):
+            out["error"] = rv.get("error_code") or "review failed"
+    out["state"] = state
+    out["elapsed_seconds"] = elapsed
+    if state == "COMPLETED":
+        out["workspace_expires_at"] = _iso(rv["hard_deadline"])
+        out["note"] = "结果已交付。追问用 codex_project_continue(review_id)；不再需要时调 codex_project_finalize(review_id) 删除服务端源码。"
+    return out
 
 
 @mcp.tool(
@@ -325,6 +397,8 @@ async def codex_project_continue(
     rv, err = storage.get_review(review_id, token_id)
     if rv is None:
         return {"success": False, "error": f"review 不可用: {err}", "error_code": err}
+    if rv["state"] == "REVIEWING":
+        return {"success": False, "error": "该审查仍在后台进行中，请先用 codex_review_status 等待 COMPLETED 再续问", "error_code": "STILL_RUNNING"}
 
     global _CODEX_SEMAPHORE
     if _CODEX_SEMAPHORE is None:
