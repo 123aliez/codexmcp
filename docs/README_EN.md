@@ -16,6 +16,22 @@ English | [简体中文](../README.md)
 
 ---
 
+## About this fork (PM-workflow edition)
+
+Forked from [GuDaStudio/codexmcp](https://github.com/GuDaStudio/codexmcp) for a workflow where Claude (Opus) plans and accepts work and Codex executes it. The tool is still called `codex` and every upstream parameter still works. Changes in v0.8.0:
+
+- **Real parallelism:** upstream blocked the event loop, so concurrent calls ran one after another. Each call now runs in a worker thread.
+- **`timeout` parameter** (default 3600 s, or `$CODEXMCP_TIMEOUT`). Codex and its child processes are stopped on timeout and when the client cancels the call.
+- **Prompt sent via stdin**, as the official Codex SDK does. Upstream put the prompt on the command line, and on Windows it was escaped into literal `\n` / `\"` and capped by the command-line length limit.
+- **Execution evidence** for acceptance checks: `files_changed`, `commands` (with exit codes and output tails for failures), `usage` and `elapsed_sec`. `agent_messages` holds only Codex's final reply.
+- `SESSION_ID` and partial evidence are still returned on failure or timeout.
+- Fixed the `image` parameter crash, and image paths now resolve against `cd`.
+- A clear error when `cd` does not exist.
+
+The PM-mode config (CLAUDE.md snippet, `codex-delegate` skill, permissions example) is in [docs/pm-mode](./pm-mode). Tests: `uv run pytest` (uses `tests/fake_codex.py`; no network needed).
+
+---
+
 ## I. Introduction
 
 In today's AI-assisted programming landscape, **Claude Code** excels at architectural design and high-level thinking, while **Codex** demonstrates exceptional prowess in code generation and granular optimization. **CodexMCP** serves as the bridge between them, leveraging the MCP protocol to create powerful synergies:
@@ -78,7 +94,7 @@ claude mcp remove codex
 **1.2** Install CodexMCP.
 
 ```bash
-claude mcp add codex -s user --transport stdio -- uvx --from git+https://github.com/GuDaStudio/codexmcp.git codexmcp
+claude mcp add codex -s user --transport stdio -- uvx --from git+https://github.com/123aliez/codexmcp.git codexmcp
 ```
 
 **1.3** Verify the installation. Run in your **terminal**:
@@ -89,7 +105,7 @@ claude mcp list
 
 > [!IMPORTANT]
 > If you see the following output, installation was successful!
->  `codex: uvx --from git+https://github.com/GuDaStudio/codexmcp.git codexmcp - ✓ Connected`
+>  `codex: uvx --from git+https://github.com/123aliez/codexmcp.git codexmcp - ✓ Connected`
 
 **1.4** Optionally allow Claude Code to automatically interact with Codex by adding `mcp__codex__codex` to the allow list in `~/.claude/settings.json`
 ![](../images/image.png)
@@ -243,7 +259,7 @@ You **must execute** the following steps:
 <details>
 <summary>Q2: Will parallel calls conflict?</summary>
 
-No. Each call uses an independent `SESSION_ID`, ensuring complete isolation.
+Sessions don't conflict: each call uses its own `SESSION_ID`, and in this fork calls run concurrently. However, two parallel `workspace-write` calls that edit the same files will overwrite each other's changes, so avoid that.
 
 </details>
 
@@ -259,7 +275,7 @@ No. Each call uses an independent `SESSION_ID`, ensuring complete isolation.
 
 ```bash
 # Clone the repository
-git clone https://github.com/GuDaStudio/codexmcp.git
+git clone https://github.com/123aliez/codexmcp.git
 cd codexmcp
 
 # Install dependencies
