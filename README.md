@@ -16,6 +16,26 @@
 
 ---
 
+## 〇、本 Fork 说明（PM 工作流版）
+
+本仓库 fork 自 [GuDaStudio/codexmcp](https://github.com/GuDaStudio/codexmcp)，面向 **"Claude（Opus）做产品经理负责规划与验收、Codex 负责执行"** 的工作方式做了二次修改。工具名仍为 `codex`，原有参数全部兼容。
+
+| 问题（上游 v0.7.4） | 本 fork（v0.8.0） |
+|---|---|
+| 工具内部同步阻塞事件循环，多个调用实际串行执行（实测 3 个各 2 秒的调用共 7 秒） | 在线程中运行，真正并行（同样测试约 2 秒） |
+| 无超时：Codex 卡住时工具永不返回 | `timeout` 参数（默认 3600 秒，可用环境变量 `CODEXMCP_TIMEOUT` 修改），超时后连同子进程一起终止 |
+| 客户端取消调用后 Codex 继续运行 | 取消时终止 Codex 及其子进程 |
+| `image` 参数直接报错（`Path` 无法 `join`） | 已修复；相对路径按 `cd` 解析，续接会话时也能附图 |
+| 提示词放在命令行；Windows 上被转义成字面量 `\n`、`\"`，且通过 npm 的 `codex.cmd` 启动时受 cmd.exe 约 8191 字符的命令行长度限制 | 与官方 Codex SDK 一样通过 stdin 传递，原样到达，无长度限制 |
+| 返回值只有 Codex 的自述，无法客观验收 | 默认返回 `files_changed`（改动文件）、`commands`（执行过的命令与退出码，失败命令附输出尾部）、`usage`、`elapsed_sec` |
+| 多条中间消息无分隔拼接在一起 | `agent_messages` 只返回最终回复（与 `codex exec -o` 一致）；需要全部事件时用 `return_all_messages` |
+| 失败时丢失 `SESSION_ID`，无法续接 | 失败、超时时依然返回 `SESSION_ID` 和已收集的证据 |
+| `cd` 不存在时静默失败 | 直接返回明确的错误信息 |
+
+PM 工作流的配置（CLAUDE.md 片段、`codex-delegate` skill、权限示例）见 [docs/pm-mode](./docs/pm-mode)。测试：`uv run pytest`（使用 `tests/fake_codex.py` 模拟 Codex，无需联网）。
+
+---
+
 ## 一、项目简介 
 
 在当前 AI 辅助编程生态中，**Claude Code** 擅长架构设计与全局思考，而 **Codex** 在代码生成与细节优化上表现卓越。**CodexMCP** 作为两者之间的桥梁，通过 MCP 协议让它们优势互补：
@@ -80,7 +100,7 @@ claude mcp remove codex
 **1.2** 安装 CodexMCP。
 
 ```bash
-claude mcp add codex -s user --transport stdio -- uvx --from git+https://github.com/GuDaStudio/codexmcp.git codexmcp
+claude mcp add codex -s user --transport stdio -- uvx --from git+https://github.com/123aliez/codexmcp.git codexmcp
 ```
 
 **1.3** 验证安装。在 **终端** 中运行：
@@ -91,14 +111,20 @@ claude mcp list
 
 > [!IMPORTANT]
 > 如果看到如下描述，说明安装成功！
->  `codex: uvx --from git+https://github.com/GuDaStudio/codexmcp.git codexmcp - ✓ Connected` 
+>  `codex: uvx --from git+https://github.com/123aliez/codexmcp.git codexmcp - ✓ Connected` 
+
+> [!TIP]
+> 从上游版本切换过来时，先 `claude mcp remove codex -s user` 再重新添加。如果 `uvx` 仍在使用旧的缓存版本，执行一次 `uv cache clean codexmcp`。
 
 **1.4** 可选择默认允许claude code自动与codex交互，在`~/.claude/settings.json`添加 `mcp__codex__codex` allow项
 ![](images/image.png)
 
 ### 2. 配置claude code提示词（可选）
 
-为使claude code更好完成与codex的协同工作，我们**极力推荐您在 `~/.claude/CLAUDE.md`中添加以下内容**
+> [!IMPORTANT]
+> 下面折叠的是**上游原版提示词**，它对应"Claude 亲自写代码、Codex 只读给参考"的模式，与本 fork 的 PM 工作流正好相反（要求 Codex 只出 diff、由 Claude 重写代码）。如果你要让 Claude 只规划和验收、由 Codex 执行，请改用 [docs/pm-mode](./docs/pm-mode) 中的配置，并从 `~/.claude/CLAUDE.md` 删除下面这段。
+
+为使claude code更好完成与codex的协同工作，上游推荐在 `~/.claude/CLAUDE.md`中添加以下内容：
 
 <details>
 <summary>展开查看prompt</summary>
@@ -205,6 +231,7 @@ claude mcp list
 | `model` | `str \| None` | ❌ | `None` | 指定使用的模型（默认使用用户配置） |
 | `yolo` | `bool \| None` | ❌ | `False` | 无需审批运行所有命令（跳过沙箱） |
 | `profile` | `str \| None` | ❌ | `None` | 从 `~/.codex/config.toml` 加载的配置文件名称 |
+| `timeout` | `int` | ❌ | `3600` | 超过该秒数即终止 Codex（0 表示不限时）；默认值可用环境变量 `CODEXMCP_TIMEOUT` 修改 |
 
 </details>
 
@@ -216,16 +243,29 @@ claude mcp list
 {
   "success": true,
   "SESSION_ID": "550e8400-e29b-41d4-a716-446655440000",
-  "agent_messages": "Codex 的回复内容...",
+  "agent_messages": "Codex 的最终回复...",
+  "files_changed": [{"path": "src/app.py", "kind": "update"}, {"path": "tests/test_app.py", "kind": "add"}],
+  "commands": [
+    {"cmd": "pytest -q", "exit_code": 1, "output_tail": "1 failed, 4 passed in 0.12s"},
+    {"cmd": "pytest -q", "exit_code": 0}
+  ],
+  "usage": {"input_tokens": 1200, "cached_input_tokens": 800, "output_tokens": 300, "reasoning_output_tokens": 50},
+  "elapsed_sec": 42.0,
   "all_messages": [...]  // 仅当 return_all_messages=True 时包含
 }
 ```
 
-**失败时：**
+- `files_changed` 只包含 Codex 通过补丁工具做的修改；由 shell 命令（格式化、代码生成、`sed -i`）改动的文件不会列出，验收时请以 `git status` / `git diff` 为准。
+- `commands` 最多列出最近 20 条，另外保留更早的失败命令，省略的条数记在 `commands_omitted`；最后 3 条失败命令附带 `output_tail`。
+
+**失败时（含超时）：**
 ```json
 {
   "success": false,
-  "error": "错误信息描述"
+  "SESSION_ID": "550e8400-...",   // 已知时仍会返回，可用于续接
+  "error": "错误信息描述（附 Codex stderr 尾部）",
+  "files_changed": [...],
+  "commands": [...]
 }
 ```
 
@@ -245,7 +285,7 @@ claude mcp list
 <details>
 <summary>Q2: 并行调用会冲突吗？</summary>
 
-不会。每个调用使用独立的 `SESSION_ID`，完全隔离。
+会话层面不会：每个调用使用独立的 `SESSION_ID`。本 fork 中多个调用会真正并发执行；但两个 `workspace-write` 调用同时修改同一批文件时会互相覆盖，请避免。
 
 </details>
 
@@ -261,7 +301,7 @@ claude mcp list
 
 ```bash
 # 克隆仓库
-git clone https://github.com/GuDaStudio/codexmcp.git
+git clone https://github.com/123aliez/codexmcp.git
 cd codexmcp
 
 # 安装依赖

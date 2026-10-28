@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codex__codex",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)"
+    ],
+    "deny": [
+      "Edit(src/**)",
+      "Write(src/**)",
+      "Edit(tests/**)",
+      "Write(tests/**)"
+    ]
+  }
+}
