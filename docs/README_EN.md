@@ -28,7 +28,7 @@ Forked from [GuDaStudio/codexmcp](https://github.com/GuDaStudio/codexmcp) for a 
 - Fixed the `image` parameter crash, and image paths now resolve against `cd`.
 - A clear error when `cd` does not exist.
 
-The PM-mode config (CLAUDE.md snippet, `codex-delegate` skill, permissions example) is in [docs/pm-mode](./pm-mode). Tests: `uv run pytest` (uses `tests/fake_codex.py`; no network needed).
+The PM-mode config (CLAUDE.md snippet, permissions example) is in [docs/pm-mode](./pm-mode); the delegation skill lives in [123aliez/codex-delegate](https://github.com/123aliez/codex-delegate). Tests: `uv run pytest` (uses `tests/fake_codex.py`; no network needed).
 
 ---
 

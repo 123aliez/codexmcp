@@ -4,19 +4,16 @@
 
 | 文件 | 放到哪里 | 作用 |
 |---|---|---|
-| `skills/codex-delegate/SKILL.md` | `~/.claude/skills/codex-delegate/SKILL.md`（用户级，所有项目通用） | 任务书模板、沙箱选择、返回值解读、验收清单，需要时才加载 |
 | `CLAUDE.md` | 追加到项目的 `CLAUDE.md` 或 `~/.claude/CLAUDE.md` | 角色定位和几条铁律，每次会话都会加载。工作区已有自己的规则体系时（如在规则文件里写了 PM 模式），不需要这个文件 |
 | `settings.example.json` | 合并进启动 Claude Code 的那个目录下的 `.claude/settings.json` | 免确认调用 `codex` 工具；按扩展名禁止 Claude 直接编辑代码文件 |
 
-## 安装 skill（Linux / macOS）
+## 委派 skill
+
+任务书模板、验收清单等委派流程已独立为 skill，仓库是 [123aliez/codex-delegate](https://github.com/123aliez/codex-delegate)，安装方法见该仓库的 README：
 
 ```bash
-mkdir -p ~/.claude/skills/codex-delegate
-curl -fsSL https://raw.githubusercontent.com/123aliez/codexmcp/main/docs/pm-mode/skills/codex-delegate/SKILL.md \
-  -o ~/.claude/skills/codex-delegate/SKILL.md
+git clone https://github.com/123aliez/codex-delegate.git ~/.claude/skills/codex-delegate
 ```
-
-访问 GitHub 需要代理时，在 `curl` 前加 `https_proxy=http://127.0.0.1:10808`（端口换成你自己的）。更新 skill 时重新执行一遍即可。
 
 ## 注意
 

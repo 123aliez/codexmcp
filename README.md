@@ -32,7 +32,7 @@
 | 失败时丢失 `SESSION_ID`，无法续接 | 失败、超时时依然返回 `SESSION_ID` 和已收集的证据 |
 | `cd` 不存在时静默失败 | 直接返回明确的错误信息 |
 
-PM 工作流的配置（CLAUDE.md 片段、`codex-delegate` skill、权限示例）见 [docs/pm-mode](./docs/pm-mode)。测试：`uv run pytest`（使用 `tests/fake_codex.py` 模拟 Codex，无需联网）。
+PM 工作流的配置（CLAUDE.md 片段、权限示例）见 [docs/pm-mode](./docs/pm-mode)；委派 skill 见 [123aliez/codex-delegate](https://github.com/123aliez/codex-delegate)。测试：`uv run pytest`（使用 `tests/fake_codex.py` 模拟 Codex，无需联网）。
 
 ---
 
