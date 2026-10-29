@@ -1,16 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "mcp__codex__codex",
-      "Bash(git status*)",
-      "Bash(git diff*)",
-      "Bash(git log*)"
+      "mcp__codex__codex"
     ],
     "deny": [
-      "Edit(src/**)",
-      "Write(src/**)",
-      "Edit(tests/**)",
-      "Write(tests/**)"
+      "Edit(**/*.py)",
+      "Edit(**/*.js)",
+      "Edit(**/*.ts)",
+      "Edit(**/*.tsx)",
+      "Edit(**/*.go)",
+      "Edit(**/*.rs)",
+      "Edit(**/*.java)",
+      "Edit(**/*.c)",
+      "Edit(**/*.cpp)",
+      "Edit(**/*.sh)"
     ]
   }
 }
